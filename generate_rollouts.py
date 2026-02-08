@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import List, Dict
 from dotenv import load_dotenv
 from utils import extract_boxed_answers, check_answer, split_solution_into_chunks, load_math_problems
+from vllm_utils import auto_detect_model_name, make_vllm_request
 from transformers import TextStreamer
 
 # Load environment variables
@@ -21,6 +22,8 @@ OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 NOVITA_API_KEY = os.getenv("NOVITA_API_KEY")
 TOGETHER_API_KEY = os.getenv("TOGETHER_API_KEY")
 FIREWORKS_API_KEY = os.getenv("FIREWORKS_API_KEY")
+VLLM_BASE_URL = os.getenv("VLLM_BASE_URL", "http://localhost:8000/v1")
+VLLM_MODEL_NAME = os.getenv("VLLM_MODEL_NAME", None)
 
 # Set up argument parser
 import argparse
@@ -43,7 +46,7 @@ parser.add_argument('-ic', '--include_chunks', type=str, default=None, help='Com
 parser.add_argument('-ty', '--type', type=str, default=None, help='Problem type filter')
 parser.add_argument('-l', '--level', type=str, default="Level 5", help='Problem level filter')
 parser.add_argument('-sp', '--split', type=str, default='train', choices=['train', 'test'], help='Dataset split to use')
-parser.add_argument('-p', '--provider', type=str, default="Novita", choices=['Novita', 'Together', 'Fireworks', 'Local'], help='Provider to use') # "Together"
+parser.add_argument('-p', '--provider', type=str, default="Novita", choices=['Novita', 'Together', 'Fireworks', 'Local', 'VLLM'], help='Provider to use') # "Together"
 parser.add_argument('-or', '--use_openrouter', default=False, action='store_true', help='Use OpenRouter API')
 parser.add_argument('-fp', '--frequency_penalty', type=float, default=None, help='Frequency penalty parameter')
 parser.add_argument('-pp', '--presence_penalty', type=float, default=None, help='Presence penalty parameter')
@@ -55,7 +58,14 @@ parser.add_argument('-q', '--quantize', default=False, action='store_true', help
 parser.add_argument('-bs', '--batch_size', type=int, default=8, help='Batch size for local model')
 parser.add_argument('-mr', '--max_retries', type=int, default=1, help='Maximum number of retries for API requests')
 parser.add_argument('-os', '--output_suffix', type=str, default=None, help='Suffix to add to the output directory')
+parser.add_argument('--vllm_base_url', type=str, default=None, help='vLLM server base URL (default from VLLM_BASE_URL env var)')
+parser.add_argument('--vllm_model_name', type=str, default=None, help='vLLM model name (auto-detected if not set)')
 args = parser.parse_args()
+
+# Resolve vLLM settings from args or env vars
+if args.provider == "VLLM":
+    args.vllm_base_url = args.vllm_base_url or VLLM_BASE_URL
+    args.vllm_model_name = args.vllm_model_name or VLLM_MODEL_NAME
 
 # Create output directory
 base_output_dir = Path(args.output_dir) / args.model.split("/")[-1] / f"temperature_{str(args.temperature)}_top_p_{str(args.top_p)}"
@@ -221,7 +231,7 @@ def generate_with_local_model_batch(prompts: List[str], temperature: float, top_
         return [{"error": str(e)} for _ in range(len(prompts))]
 
 async def make_api_request(prompt: str, temperature: float, top_p: float, max_tokens: int) -> Dict:
-    """Make an API request to either Novita, Together, Fireworks, or use a local model based on provider setting."""
+    """Make an API request to Novita, Together, Fireworks, vLLM, or use a local model based on provider setting."""
     # If using local model, use synchronous generation
     if args.provider == "Local":
         return generate_with_local_model(prompt, temperature, top_p, max_tokens)
@@ -283,7 +293,34 @@ async def make_api_request(prompt: str, temperature: float, top_p: float, max_to
         }
         
         api_url = "https://api.fireworks.ai/inference/v1/completions"
-    
+
+    elif args.provider == "VLLM":
+        # Delegate to vllm_utils for clean separation
+        vllm_base = getattr(args, 'vllm_base_url', VLLM_BASE_URL) or VLLM_BASE_URL
+        vllm_model = getattr(args, 'vllm_model_name', VLLM_MODEL_NAME) or VLLM_MODEL_NAME or args.model
+        extra = {}
+        if args.frequency_penalty is not None:
+            extra["frequency_penalty"] = args.frequency_penalty
+        if args.presence_penalty is not None:
+            extra["presence_penalty"] = args.presence_penalty
+        if args.repetition_penalty is not None:
+            extra["repetition_penalty"] = args.repetition_penalty
+        if args.top_k is not None:
+            extra["top_k"] = args.top_k
+        if args.min_p is not None:
+            extra["min_p"] = args.min_p
+        return await make_vllm_request(
+            prompt=prompt,
+            base_url=vllm_base,
+            model_name=vllm_model,
+            temperature=temperature,
+            top_p=top_p,
+            max_tokens=max_tokens,
+            stream=True,
+            extra_params=extra if extra else None,
+            max_retries=args.max_retries,
+        )
+
     # Add optional parameters for all APIs
     if args.frequency_penalty is not None:
         payload["frequency_penalty"] = args.frequency_penalty
@@ -305,7 +342,7 @@ async def make_api_request(prompt: str, temperature: float, top_p: float, max_to
     for attempt in range(max_retries):
         try:
             # Handle streaming responses for Together and Fireworks
-            if (args.provider == "Together" or args.provider == "Fireworks") and payload.get("stream", False):
+            if (args.provider in ("Together", "Fireworks")) and payload.get("stream", False):
                 return await handle_streaming_response(api_url, headers, payload)
             
             # For non-streaming responses
@@ -337,13 +374,7 @@ async def make_api_request(prompt: str, temperature: float, top_p: float, max_to
                 # Success case
                 result = response.json()
                 
-                if args.provider == "Novita" or args.provider == "Together":
-                    return {
-                        "text": result["choices"][0]["text"],
-                        "finish_reason": result["choices"][0].get("finish_reason", ""),
-                        "usage": result.get("usage", {})
-                    }
-                elif args.provider == "Fireworks":
+                if args.provider in ("Novita", "Together", "Fireworks"):
                     return {
                         "text": result["choices"][0]["text"],
                         "finish_reason": result["choices"][0].get("finish_reason", ""),

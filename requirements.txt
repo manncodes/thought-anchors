@@ -18,6 +18,11 @@ plotly>=5.14.0
 openai>=1.0.0
 httpx>=0.24.0
 python-dotenv>=1.0.0
+fastapi>=0.104.0
+uvicorn>=0.24.0
+pydantic-settings>=2.0.0
 
 tqdm>=4.65.0
+pytest>=7.0.0
+pytest-asyncio>=0.21.0
 pkld>=1.0.0  # For caching/pickling decorator, see whitebox-analyses/README_on_pkld_decorator.md
